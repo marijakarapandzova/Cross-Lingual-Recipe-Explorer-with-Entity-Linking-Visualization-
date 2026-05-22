@@ -1,28 +1,35 @@
 """
 Agentic Entity Linking Agent
-Implements the 5-stage pipeline from the thesis:
-  1. Analyze  (language detection + translation)
-  2. Decide Context (ambiguity check)
-  3. Fetch Context (recipe co-occurrence, conditional)
-  4. Search USDA (keyword similarity – or FAISS in production)
-  5. Evaluate & Select (LLM reasoning – or heuristic fallback)
+Implements the 5-stage pipeline from the thesis (section 3.2):
+  1. Analyze        — language detection + translation
+  2. Decide Context — ambiguity check
+  3. Fetch Context  — recipe co-occurrence (conditional)
+  4. Search USDA    — keyword similarity over 7,793-entry USDA dataset
+  5. Evaluate       — LLM reasoning or heuristic fallback
 
-Dependencies:
-  - openai  (optional – falls back to rule-based if not installed / no key)
-  - All other logic uses only the Python stdlib + the parsed_recipes.json dataset.
+LLM priority: Anthropic Claude → OpenAI → rule-based fallback
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import random
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
-# OpenAI is optional
+# Anthropic (preferred LLM)
+try:
+    import anthropic as _anthropic_module
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+
+# OpenAI (fallback LLM)
 try:
     from openai import OpenAI as _OpenAI
     _OPENAI_AVAILABLE = True
@@ -84,7 +91,7 @@ class RecipeContextTool:
         print("Loading recipe dataset …", flush=True)
         with open(recipes_path, encoding="utf-8") as f:
             self.recipes: list[dict] = json.load(f)
-        print(f"  → {len(self.recipes):,} recipes loaded", flush=True)
+        print(f"  {len(self.recipes):,} recipes loaded", flush=True)
 
     def search(self, ingredient_name: str, top_k: int = 5) -> list[ContextRecipe]:
         needle = ingredient_name.lower().strip()
@@ -105,10 +112,28 @@ class RecipeContextTool:
 
 
 # ---------------------------------------------------------------------------
-# USDA database (curated subset; replace with FAISS index in production)
+# USDA database — loaded from usdaClasses.csv (7,793 entries)
 # ---------------------------------------------------------------------------
 
-USDA_DATABASE = [
+def _load_usda_csv(csv_path: str) -> list[dict]:
+    """Load USDA food entries from CSV with columns: Name, Index."""
+    entries = []
+    try:
+        with open(csv_path, encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = row.get("Name", "").strip()
+                idx = row.get("Index", "").strip()
+                if name and idx:
+                    entries.append({"id": idx, "name": name})
+        print(f"  {len(entries):,} USDA entries loaded from CSV", flush=True)
+    except FileNotFoundError:
+        print(f"  [!] usdaClasses.csv not found at: {csv_path}", flush=True)
+    return entries
+
+
+# Minimal built-in fallback used when CSV is unavailable
+_BUILTIN_USDA = [
     {"id": "171284", "name": "Yogurt, Greek, plain, nonfat"},
     {"id": "171285", "name": "Yogurt, Greek, plain, whole milk"},
     {"id": "175213", "name": "Yogurt, plain, low fat"},
@@ -151,7 +176,6 @@ USDA_DATABASE = [
     {"id": "169761", "name": "Wheat flour, white, all-purpose, unenriched"},
     {"id": "168897", "name": "Rice, white, long-grain, regular, unenriched, raw"},
     {"id": "170273", "name": "Pasta, dry, unenriched"},
-    {"id": "168994", "name": "Granola, homemade"},
     {"id": "172336", "name": "Oil, olive, salad or cooking"},
     {"id": "171410", "name": "Oil, sunflower, linoleic, (approx. 65%)"},
     {"id": "171287", "name": "Egg, whole, raw, fresh"},
@@ -177,26 +201,36 @@ USDA_DATABASE = [
     {"id": "174834", "name": "Wine, table, red"},
     {"id": "169416", "name": "Margarine, regular, hard, soybean"},
     {"id": "171033", "name": "Baking powder"},
-    {"id": "172185", "name": "Cream, fluid, heavy whipping"},
     {"id": "174176", "name": "Sauce, tomato, canned"},
     {"id": "170501", "name": "Mushrooms, white, raw"},
 ]
 
 
 class USDASearchTool:
-    """Keyword + Jaccard similarity search. Replace with FAISS in production."""
+    """Keyword + Jaccard similarity search over the USDA dataset."""
+
+    def __init__(self, csv_path: Optional[str] = None):
+        if csv_path:
+            loaded = _load_usda_csv(csv_path)
+            self.database = loaded if loaded else _BUILTIN_USDA
+        else:
+            self.database = _BUILTIN_USDA
+            print(f"  [!] No CSV path — using built-in {len(_BUILTIN_USDA)}-entry subset", flush=True)
+
+    @property
+    def size(self) -> int:
+        return len(self.database)
 
     def search(self, query: str, top_k: int = 10) -> list[USDACandidate]:
         query_tokens = set(re.findall(r"\w+", query.lower()))
         scored: list[tuple[float, dict]] = []
-        for entry in USDA_DATABASE:
+        for entry in self.database:
             entry_tokens = set(re.findall(r"\w+", entry["name"].lower()))
             if not entry_tokens:
                 continue
             overlap = len(query_tokens & entry_tokens)
             union = len(query_tokens | entry_tokens)
             score = overlap / union if union else 0.0
-            # small boost for long shared tokens
             for t in query_tokens:
                 if len(t) > 4 and t in entry["name"].lower():
                     score = min(1.0, score + 0.12)
@@ -354,44 +388,98 @@ class EntityLinkingAgent:
     def __init__(
         self,
         recipes_path: str,
+        usda_csv_path: Optional[str] = None,
+        anthropic_api_key: Optional[str] = None,
         openai_api_key: Optional[str] = None,
-        model: str = "gpt-3.5-turbo",
+        model: Optional[str] = None,
     ):
-        key = openai_api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.provider: Optional[str] = None
         self.client = None
-        if key and _OPENAI_AVAILABLE:
-            try:
-                self.client = _OpenAI(api_key=key)
-            except Exception:
-                pass
         self.model = model
+
+        # Try Anthropic first
+        ant_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        if ant_key and _ANTHROPIC_AVAILABLE:
+            try:
+                self.client = _anthropic_module.Anthropic(api_key=ant_key)
+                self.provider = "anthropic"
+                self.model = model or "claude-haiku-4-5-20251001"
+                print(f"  LLM: Anthropic Claude ({self.model})", flush=True)
+            except Exception as e:
+                print(f"  [!] Anthropic init failed: {e}", flush=True)
+
+        # Fall back to OpenAI
+        if not self.client:
+            oai_key = openai_api_key or os.environ.get("OPENAI_API_KEY", "")
+            if oai_key and _OPENAI_AVAILABLE:
+                try:
+                    self.client = _OpenAI(api_key=oai_key)
+                    self.provider = "openai"
+                    self.model = model or "gpt-3.5-turbo"
+                    print(f"  LLM: OpenAI ({self.model})", flush=True)
+                except Exception as e:
+                    print(f"  [!] OpenAI init failed: {e}", flush=True)
+
+        if not self.client:
+            print("  LLM: rule-based fallback (no API key configured)", flush=True)
+
         self.recipe_tool = RecipeContextTool(recipes_path)
-        self.usda_tool = USDASearchTool()
+        self.usda_tool = USDASearchTool(usda_csv_path)
+
+    # ------------------------------------------------------------------
+    # LLM call — handles both Anthropic and OpenAI transparently
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _strip_json_fence(text: str) -> str:
+        """Remove markdown code fences that some models add around JSON."""
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            start = 1
+            end = len(lines) - 1 if lines[-1].strip() == "```" else len(lines)
+            text = "\n".join(lines[start:end]).strip()
+        return text
 
     def _llm(self, system: str, user: str, json_mode: bool = False) -> str:
         if not self.client:
-            print("DEBUG: No client available for LLM call", flush=True)
-            return ""
-        kwargs: dict = dict(
-            model=self.model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0,
-            max_tokens=800,
-        )
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-        try:
-            print(f"DEBUG: Calling LLM with model {self.model}", flush=True)
-            resp = self.client.chat.completions.create(**kwargs)
-            result = resp.choices[0].message.content or ""
-            print(f"DEBUG: LLM response received: {len(result)} chars", flush=True)
-            return result
-        except Exception as e:
-            print(f"DEBUG: LLM error: {str(e)}", flush=True)
             return ""
 
+        if self.provider == "anthropic":
+            sys_text = system
+            if json_mode:
+                sys_text += "\nRespond with valid JSON only — no markdown, no code fences, no extra text."
+            try:
+                msg = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=800,
+                    temperature=0,
+                    system=sys_text,
+                    messages=[{"role": "user", "content": user}],
+                )
+                return self._strip_json_fence(msg.content[0].text)
+            except Exception as e:
+                print(f"Anthropic error: {e}", flush=True)
+                return ""
+
+        else:  # openai
+            kwargs: dict = dict(
+                model=self.model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0,
+                max_tokens=800,
+            )
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            try:
+                resp = self.client.chat.completions.create(**kwargs)
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                print(f"OpenAI error: {e}", flush=True)
+                return ""
+
     # ------------------------------------------------------------------
-    # Stage 1
+    # Stage 1 — Analyze
     # ------------------------------------------------------------------
     def _stage_analyze(self, ingredient: str) -> tuple[str, str]:
         raw = self._llm(
@@ -408,36 +496,29 @@ class EntityLinkingAgent:
                 pass
 
         # Fallback: Cyrillic detection + dictionary lookup
-        has_cyrillic = any("\u0400" <= ch <= "\u04FF" for ch in ingredient)
+        has_cyrillic = any("Ѐ" <= ch <= "ӿ" for ch in ingredient)
         if has_cyrillic:
             lower = ingredient.lower().strip()
-            # 1. Exact match
             if lower in MK_DICT:
                 return "mk", MK_DICT[lower]
-            # 2. Longest-prefix match (handles "кромид по потреба" → кромид)
             best_key, best_val = "", ""
             for key, val in MK_DICT.items():
                 if lower.startswith(key) and len(key) > len(best_key):
                     best_key, best_val = key, val
             if best_val:
                 return "mk", best_val
-            # 3. Substring match (ingredient contains dict key)
             for key, val in sorted(MK_DICT.items(), key=lambda x: -len(x[0])):
                 if key in lower:
                     return "mk", val
-            # 4. Token-level match
             tokens = lower.split()
-            translations = []
-            for tok in tokens:
-                if tok in MK_DICT:
-                    translations.append(MK_DICT[tok])
+            translations = [MK_DICT[tok] for tok in tokens if tok in MK_DICT]
             if translations:
                 return "mk", " ".join(translations)
-            return "mk", ingredient  # untranslated, pass as-is
+            return "mk", ingredient
         return "en", ingredient
 
     # ------------------------------------------------------------------
-    # Stage 2
+    # Stage 2 — Decide Context
     # ------------------------------------------------------------------
     def _stage_decide_context(self, ingredient: str, english: str) -> bool:
         raw = self._llm(
@@ -456,7 +537,7 @@ class EntityLinkingAgent:
         return bool(tokens & (GENERIC_MK | GENERIC_EN))
 
     # ------------------------------------------------------------------
-    # Stage 4: query formulation
+    # Stage 4 — Query formulation
     # ------------------------------------------------------------------
     def _formulate_query(self, english: str, context: list[ContextRecipe]) -> str:
         if not context:
@@ -476,7 +557,7 @@ class EntityLinkingAgent:
         return english
 
     # ------------------------------------------------------------------
-    # Stage 5: evaluate
+    # Stage 5 — Evaluate & Select
     # ------------------------------------------------------------------
     def _stage_evaluate(
         self,
@@ -496,7 +577,6 @@ class EntityLinkingAgent:
             "\n".join(f"- {c.title}: {c.usage_note}" for c in context[:3])
             if context else "No context."
         )
-        print(f"DEBUG: _stage_evaluate - client is: {self.client}", flush=True)
         raw = self._llm(
             "Select the best USDA entry. "
             "Respond ONLY with JSON: {\"selected_index\": 1, \"confidence\": 85, \"reasoning\": \"...\"}. "
@@ -504,7 +584,6 @@ class EntityLinkingAgent:
             f"Ingredient: {ingredient_original} / {english}\nContext:\n{ctx_text}\nCandidates:\n{cand_text}",
             json_mode=True,
         )
-        print(f"DEBUG: _stage_evaluate - raw response length: {len(raw) if raw else 0}", flush=True)
         if raw:
             try:
                 p = json.loads(raw)
@@ -517,13 +596,13 @@ class EntityLinkingAgent:
             except Exception:
                 pass
 
-        # Fallback: highest score
+        # Fallback: highest keyword score
         best = max(candidates, key=lambda c: c.score)
         conf = int(min(100, best.score * 110))
         lv = "high" if conf >= 80 else "med" if conf >= 55 else "low"
         reason = (
-            f"Rule-based selection: highest keyword similarity score ({best.score:.2f}). "
-            f"Add an OpenAI API key for LLM-driven reasoning."
+            f"Rule-based selection: highest keyword similarity ({best.score:.2f}). "
+            f"Add an API key for LLM-driven reasoning."
         )
         return best, conf, lv, reason
 
@@ -555,7 +634,7 @@ class EntityLinkingAgent:
             trace.tool_calls.append(ToolCall(
                 name="get_recipe_context",
                 args={"ingredient": ingredient_name, "top_k": 5},
-                result_summary=f"Found {len(context)} recipes with this ingredient",
+                result_summary=f"Found {len(context)} recipes containing this ingredient",
             ))
         trace.stages_completed.append("fetch_context")
 
@@ -567,7 +646,7 @@ class EntityLinkingAgent:
         trace.tool_calls.append(ToolCall(
             name="search_usda_classes",
             args={"query": query, "top_k": 10},
-            result_summary=f"Found {len(candidates)} USDA candidates",
+            result_summary=f"Found {len(candidates)} USDA candidates from {self.usda_tool.size:,}-entry database",
         ))
         trace.stages_completed.append("search_usda")
 

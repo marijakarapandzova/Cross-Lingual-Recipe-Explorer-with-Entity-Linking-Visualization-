@@ -180,14 +180,16 @@ def load_agent_and_data():
     from agent.entity_linker import EntityLinkingAgent
 
     data_path = str(PROJECT_ROOT / "data" / "parsed_recipes.json")
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    usda_csv = str(PROJECT_ROOT / "usdaClasses.csv")
 
     with open(data_path, encoding="utf-8") as f:
         recipes = json.load(f)
 
     agent = EntityLinkingAgent(
         recipes_path=data_path,
-        openai_api_key=api_key,
+        usda_csv_path=usda_csv,
+        anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+        openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
     )
     return agent, recipes
 
@@ -267,52 +269,71 @@ with st.sidebar:
     run_single = st.button("⚡ Analyze", type="primary", use_container_width=True)
 
     st.divider()
-    api_key_input = st.text_input(
-        "OpenAI API Key (optional)",
+    st.subheader("🔑 LLM Configuration")
+
+    # --- Anthropic ---
+    ant_key_input = st.text_input(
+        "Anthropic API Key (preferred)",
+        type="password",
+        value=os.environ.get("ANTHROPIC_API_KEY", ""),
+        help="Claude Haiku is used for all reasoning steps.",
+    )
+    if ant_key_input and ant_key_input != os.environ.get("ANTHROPIC_API_KEY", ""):
+        os.environ["ANTHROPIC_API_KEY"] = ant_key_input
+        try:
+            import anthropic as _ant
+            client = _ant.Anthropic(api_key=ant_key_input)
+            # Light validation — list models endpoint
+            client.models.list()
+            agent.client = client
+            agent.provider = "anthropic"
+            agent.model = "claude-haiku-4-5-20251001"
+            st.sidebar.success("Anthropic connected — Claude Haiku active")
+        except Exception as e:
+            st.sidebar.error(f"Anthropic error: {e}")
+            agent.client = None
+            agent.provider = None
+
+    # --- OpenAI fallback ---
+    oai_key_input = st.text_input(
+        "OpenAI API Key (fallback)",
         type="password",
         value=os.environ.get("OPENAI_API_KEY", ""),
-        help="Without API key, a rule-based fallback is used.",
+        help="Used only if no Anthropic key is set.",
     )
-
-    # Update agent with new API key
-    if api_key_input and api_key_input != os.environ.get("OPENAI_API_KEY", ""):
-        os.environ["OPENAI_API_KEY"] = api_key_input
+    if oai_key_input and oai_key_input != os.environ.get("OPENAI_API_KEY", "") and not agent.client:
+        os.environ["OPENAI_API_KEY"] = oai_key_input
         try:
             from openai import OpenAI
-            client = OpenAI(api_key=api_key_input)
-
-            # Test the API key with a simple request
-            test_response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": "test"}],
-                max_tokens=5
-            )
-
+            client = OpenAI(api_key=oai_key_input)
+            client.models.list()
             agent.client = client
-            st.sidebar.success("✅ API Key verified and working!")
-            st.sidebar.info(f"Agent client status: {'Active' if agent.client else 'Inactive'}")
+            agent.provider = "openai"
+            agent.model = "gpt-3.5-turbo"
+            st.sidebar.success("OpenAI connected — GPT-3.5 active")
         except Exception as e:
-            error_msg = str(e)
-            st.sidebar.error(f"❌ API Key Error: {error_msg}")
-            st.sidebar.info("Make sure your API key is valid and has access to gpt-3.5-turbo or gpt-4 model.")
+            st.sidebar.error(f"OpenAI error: {e}")
             agent.client = None
-    elif not api_key_input and agent.client:
-        # Clear client if API key is removed
-        os.environ["OPENAI_API_KEY"] = ""
+            agent.provider = None
+
+    # Clear clients when keys are removed
+    if not ant_key_input and not oai_key_input and agent.client:
         agent.client = None
+        agent.provider = None
+        os.environ["ANTHROPIC_API_KEY"] = ""
+        os.environ["OPENAI_API_KEY"] = ""
 
-    # Show current agent status
-    if api_key_input:
-        has_client = agent.client is not None
-        status = "✅ LLM Active" if has_client else "❌ LLM Inactive"
-        st.sidebar.caption(f"Status: {status}")
-
-        # Debug: show if client exists
-        if has_client:
-            st.sidebar.write(f"Debug: Client type = {type(agent.client).__name__}")
+    # Provider status badge
+    if agent.provider == "anthropic":
+        st.sidebar.success(f"LLM: Claude Haiku (Anthropic)")
+    elif agent.provider == "openai":
+        st.sidebar.info(f"LLM: GPT-3.5 (OpenAI)")
+    else:
+        st.sidebar.warning("LLM: rule-based fallback")
 
     st.divider()
-    st.caption(f"📦 {len(recipes):,} Macedonian recipes loaded")
+    st.caption(f"📦 {len(recipes):,} Macedonian recipes")
+    st.caption(f"🗄 {agent.usda_tool.size:,} USDA food entries")
 
 # ---------------------------------------------------------------------------
 # Helper: render a single agent trace

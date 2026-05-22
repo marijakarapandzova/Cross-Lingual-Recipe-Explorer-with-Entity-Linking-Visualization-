@@ -26,6 +26,8 @@ from agent.entity_linker import AgentTrace, ContextRecipe, EntityLinkingAgent, U
 # ---------------------------------------------------------------------------
 
 DATA_PATH = Path(__file__).parent.parent / "data" / "parsed_recipes.json"
+USDA_CSV_PATH = Path(__file__).parent.parent / "usdaClasses.csv"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 # ---------------------------------------------------------------------------
@@ -64,6 +66,8 @@ async def startup():
     print("Initialising agent …")
     agent = EntityLinkingAgent(
         recipes_path=str(DATA_PATH),
+        usda_csv_path=str(USDA_CSV_PATH),
+        anthropic_api_key=ANTHROPIC_API_KEY,
         openai_api_key=OPENAI_API_KEY,
     )
     print("  Agent ready")
